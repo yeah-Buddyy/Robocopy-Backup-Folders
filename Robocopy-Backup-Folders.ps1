@@ -1,6 +1,3 @@
-# If you close the powershell script and robocopy is not finished yet, the started robocopy processes are still running in background. You need to close them manually via taskmanager.
-# Todo close them automatically, if user presses ctrl+c or clicks on x to exit the powershell script
-
 ### Edit here ###
 # Your backup path
 $roboCopyBackupPath = "E:\RoboCopyBackup"
@@ -144,6 +141,41 @@ foreach ($path in $sourceDirectories) {
         pause
         exit
     }
+}
+
+$monitorScriptContent = @'
+param (
+    [int]$MainScriptProcessId
+)
+
+# Monitor the main script process
+try {
+    $mainScriptProcess = Get-Process -Id $MainScriptProcessId -ErrorAction Stop
+    while ($true) {
+        Start-Sleep -Seconds 5
+        if ($mainScriptProcess.HasExited) {
+            Write-Output "Main script process has terminated. Terminating all robocopy.exe processes..."
+            Get-Process robocopy -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+            break
+        }
+    }
+} catch {
+    Write-Output "Main script process not found or already terminated."
+    Get-Process robocopy -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force }
+}
+
+exit
+'@
+
+# Save the monitor script to a temporary file
+$tempFolder = [System.IO.Path]::GetTempPath()
+$monitorScriptPath = [System.IO.Path]::Combine($tempFolder, "monitor.ps1")
+Set-Content -Path $monitorScriptPath -Value $monitorScriptContent -Force
+
+# Start the monitor script
+$mainScriptProcessId = $PID
+if (Test-Path "$monitorScriptPath" -PathType Leaf) {
+    Start-Process powershell.exe -ArgumentList "-NoProfile -NoLogo -ExecutionPolicy Bypass -File `"$monitorScriptPath`" -MainScriptProcessId $mainScriptProcessId" -WindowStyle Hidden
 }
 
 # Check if the drive letter exists
