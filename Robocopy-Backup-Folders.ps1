@@ -1,8 +1,12 @@
-# If you close the powershell script and robocopy is not finished yet, the started robocopy processes are still running in backround. You need to close them manually via taskmanager.
+# If you close the powershell script and robocopy is not finished yet, the started robocopy processes are still running in background. You need to close them manually via taskmanager.
+# Todo close them automatically, if user presses ctrl+c or clicks on x to exit the powershell script
 
 ### Edit here ###
-$usbDriveLetter = "E"
+# Your backup path
 $roboCopyBackupPath = "E:\RoboCopyBackup"
+
+# How many robocopy instances should run at the same time
+$maxThreads = 5
 
 $excludeFiles = @(
     "Thumbs.db"
@@ -23,6 +27,31 @@ $sourceDirectories = @(
     "D:\MyFolderIwantToBackup"
     "C:\Program Files"
 )
+
+function Get-DriveLetter {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    # Validate the path format
+    if ($Path -match '^[A-Za-z]:\\') {
+        # Extract the drive letter
+        $driveLetter = ($Path -split ':')[0]
+        return $driveLetter
+    } else {
+        throw "Invalid path format. The path must start with a drive letter followed by a colon and a backslash (e.g., C:\)."
+    }
+}
+
+try {
+    $driveLetter = Get-DriveLetter -Path $roboCopyBackupPath
+    Write-Output "Drive letter for '$roboCopyBackupPath' is '$driveLetter'"
+} catch {
+    Write-Output "Error processing '$roboCopyBackupPath': $_"
+    pause
+    exit
+}
 
 # Remove duplicates
 $excludeFiles = $excludeFiles | Select-Object -Unique
@@ -117,35 +146,11 @@ foreach ($path in $sourceDirectories) {
     }
 }
 
-function Remove-DriveLettersAndSubstring {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true, Position = 0)]
-        [string]$InputString
-    )
-
-    # Define a regex pattern to match drive letters from A:\ to Z:\
-    $drivePattern = '[A-Za-z]:\\'
-
-    # Replace all occurrences of the drive letter pattern with an empty string
-    $result = $InputString -creplace $drivePattern
-
-    # Find the index of the first backslash (\) after removing drive letters
-    $index = $result.IndexOf("\")
-    
-    if ($index -ge 0) {
-        # Extract the substring before the first backslash
-        $result = $result.Substring(0, $index)
-    }
-
-    return $result
-}
-
 # Check if the drive letter exists
-$driveExists = Get-PSDrive -Name $usbDriveLetter -ErrorAction SilentlyContinue
+$driveExists = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
 
 if ($driveExists) {
-    Write-Output "Drive $usbDriveLetter exists."
+    Write-Output "Drive $driveLetter exists."
 
     # create backup folder if not exists
     If(!(test-path -PathType container $roboCopyBackupPath)) {
@@ -155,19 +160,33 @@ if ($driveExists) {
     $jobs = @()
     $totalJobs = $sourceDirectories.Count
     $completedJobs = 0
+    $maxConcurrentJobs = $maxThreads
 
-    # Start multiple robocopy processes as background jobs
+    # Start multiple robocopy processes as background jobs with a limit of $maxConcurrentJobs at a time
     foreach ($source in $sourceDirectories) {
+        while (($jobs | Where-Object { $_.State -eq 'Running' }).Count -ge $maxConcurrentJobs) {
+            Start-Sleep -Seconds 1
+        }
+
+        # Remove the drive letter and colon (e.g., C:\) from the source path
         $cleanPath = $source -creplace '^[A-Za-z]:\\', ''
 
+        # Get the drive letter part of the source path (e.g., C:\)
         $driveLetter = [System.IO.Path]::GetPathRoot($source)
+        # Remove the colon and backslash from the drive letter (e.g., C)
         $trimmedString = $driveLetter.Trim(':\\')
 
+        # Replace backslashes in the cleaned path with hyphens (e.g., users\test\hello -> users-test-hello)
         $newPath = $cleanPath -replace '\\', '-'
 
+        # Combine the log folder path and the modified path to create the log file name
+        # e.g., "C:\LogFolder\C-users-test-hello.log"
         $logName = Join-Path -Path $logFolder -ChildPath $trimmedString"-"$newPath".log"
+        # Add double quotes around the log file name to handle paths with spaces
         $quotedLogName = '"' + $logName + '"'
 
+        # Combine the backup path and the cleaned source path to create the destination path
+        # e.g., "C:\BackupPath\C\users\test\hello"
         $destination = Join-Path -Path $roboCopyBackupPath -ChildPath $trimmedString"\"$cleanPath
 
         $job = Start-Job -ScriptBlock {
@@ -181,21 +200,20 @@ if ($driveExists) {
     }
 
     # Monitor progress and wait for all jobs to complete
-    foreach ($job in $jobs) {
-        while ($job.State -ne 'Completed') {
-            $completedJobs = ($jobs | Where-Object { $_.State -eq 'Completed' }).Count
-            $percentComplete = ($completedJobs / $totalJobs) * 100
-            Write-Progress -Activity "Running Robocopy" -Status "$completedJobs of $totalJobs jobs completed." -PercentComplete $percentComplete
-            Start-Sleep -Seconds 1
-        }
+    while (($jobs | Where-Object { $_.State -ne 'Completed' }).Count -gt 0) {
+        $completedJobs = ($jobs | Where-Object { $_.State -eq 'Completed' }).Count
+        $percentComplete = ($completedJobs / $totalJobs) * 100
+        Write-Progress -Activity "Running Robocopy" -Status "$completedJobs of $totalJobs jobs completed." -PercentComplete $percentComplete
 
+        Start-Sleep -Seconds 1
+    }
+
+    # Collect results and clean up jobs
+    foreach ($job in $jobs) {
         $jobResult = Receive-Job -Job $job -Wait
         $exitCode = $jobResult
 
         # Output the exit code
-        # Write-Output "Robocopy exit code: $exitCode"
-
-        # Check the exit code
         if ($exitCode -eq 0) {
             Write-Output "No files were copied. No failure was met. No files were mismatched. The files already exist in the destination directory; so the copy operation was skipped."
         }
@@ -212,9 +230,11 @@ if ($driveExists) {
 
     # Final progress bar update
     Write-Progress -Activity "Running Robocopy" -Status "All jobs completed." -PercentComplete 100 -Completed
-    #}
 } else {
-    Write-Output "Drive $usbDriveLetter does not exist."
+    Write-Output "Drive $driveLetter does not exist."
     pause
     exit
 }
+
+pause
+exit
