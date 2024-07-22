@@ -120,29 +120,95 @@ foreach ($path in $sourceDirectories) {
         Write-Output "Backup a whole drive is not supported, must be a folder"
         pause
         exit
-    } else {
-        # Write-Output "$path does not exactly match a blacklist drive root."
-    }
-}
-
-foreach ($path in $sourceDirectories) {
-    if (Test-Path -Path $path -PathType Container) {
-        # It's a directory
-        # Write-Output "Processing directory: $path"
-    }
-    elseif (Test-Path -Path $path -PathType Leaf) {
+    } elseif (Test-Path -Path $path -PathType Leaf) {
         # It's a file
         Write-Output "Backup a single file is not supported."
         pause
         exit
-    }
-    else {
+    } elseif ($path -eq $roboCopyBackupPath) {
+        Write-Output "Source and destination cannot be the same."
+        pause
+        exit
+    } elseif (-not(Test-Path -Path $path)) {
         Write-Output "Path '$path' does not exist or is not accessible."
         pause
         exit
     }
 }
 
+# Prevent Windows from going to sleep during backup
+$sleepMonitorScriptContent = @'
+param (
+    [int]$MainScriptProcessId,
+    [ValidateSet('Away', 'Display', 'System')]$Option = 'System'
+)
+
+$Code=@"
+[DllImport("kernel32.dll", CharSet = CharSet.Auto,SetLastError = true)]
+public static extern void SetThreadExecutionState(uint esFlags);
+"@
+
+$ste = Add-Type -memberDefinition $Code -name System -namespace Win32 -passThru
+
+# Requests that the other EXECUTION_STATE flags set remain in effect until
+# SetThreadExecutionState is called again with the ES_CONTINUOUS flag set and
+# one of the other EXECUTION_STATE flags cleared.
+# The thread that turns it on must be the same thread that turns it off !.
+$ES_CONTINUOUS = [uint32]"0x80000000"
+$ES_AWAYMODE_REQUIRED = [uint32]"0x00000040"
+$ES_DISPLAY_REQUIRED = [uint32]"0x00000002"
+$ES_SYSTEM_REQUIRED = [uint32]"0x00000001"
+
+Switch ($Option) {
+    "Away"    {$Setting = $ES_AWAYMODE_REQUIRED}
+    "Display" {$Setting = $ES_DISPLAY_REQUIRED}
+    "System"  {$Setting = $ES_SYSTEM_REQUIRED}
+}
+
+# Monitor the main script process
+try {
+    $mainScriptProcess = Get-Process -Id $MainScriptProcessId -ErrorAction Stop
+    while ($true) {
+        Write-Verbose "Staying Awake with ``${Option}`` Option" -Verbose
+        $ste::SetThreadExecutionState($ES_CONTINUOUS -bor $Setting)
+        Start-Sleep -Seconds 60
+        [System.Console]::Clear()
+        if ($mainScriptProcess.HasExited) {
+            Write-Verbose "Main script process has terminated" -Verbose
+            Write-Verbose "Stopping Staying Awake" -Verbose
+            Start-Sleep -Seconds 3
+            $ste::SetThreadExecutionState($ES_CONTINUOUS)
+            break
+        }
+    }
+} catch {
+    Write-Verbose "Main script process not found or already terminated." -Verbose
+    Write-Verbose "Stopping Staying Awake" -Verbose
+    Start-Sleep -Seconds 3
+    $ste::SetThreadExecutionState($ES_CONTINUOUS)
+}
+
+exit
+'@
+
+function PreventSleep {
+    param (
+        [string]$myPid
+    )
+
+    # Save the monitor script to a temporary file
+    $tempFolder = [System.IO.Path]::GetTempPath()
+    $monitorScriptPath = [System.IO.Path]::Combine($tempFolder, "sleep-monitor.ps1")
+    Set-Content -Path $monitorScriptPath -Value $sleepMonitorScriptContent -Force
+
+    # Start the monitor script
+    $mainScriptProcessId = $myPid
+    if (Test-Path "$monitorScriptPath" -PathType Leaf) {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -NoLogo -ExecutionPolicy Bypass -File `"$monitorScriptPath`" -MainScriptProcessId $mainScriptProcessId" -WindowStyle Hidden
+    }
+}
+
+# Kill all running robocopy instances. This only happens if the user exits the PowerShell script before all the Robocopy instances have finished their work.
 $monitorScriptContent = @'
 param (
     [int]$MainScriptProcessId
@@ -167,15 +233,21 @@ try {
 exit
 '@
 
-# Save the monitor script to a temporary file
-$tempFolder = [System.IO.Path]::GetTempPath()
-$monitorScriptPath = [System.IO.Path]::Combine($tempFolder, "monitor.ps1")
-Set-Content -Path $monitorScriptPath -Value $monitorScriptContent -Force
+function ForceKillRoboCopyInstances {
+    param (
+        [string]$myPid
+    )
 
-# Start the monitor script
-$mainScriptProcessId = $PID
-if (Test-Path "$monitorScriptPath" -PathType Leaf) {
-    Start-Process powershell.exe -ArgumentList "-NoProfile -NoLogo -ExecutionPolicy Bypass -File `"$monitorScriptPath`" -MainScriptProcessId $mainScriptProcessId" -WindowStyle Hidden
+    # Save the monitor script to a temporary file
+    $tempFolder = [System.IO.Path]::GetTempPath()
+    $monitorScriptPath = [System.IO.Path]::Combine($tempFolder, "monitor.ps1")
+    Set-Content -Path $monitorScriptPath -Value $monitorScriptContent -Force
+
+    # Start the monitor script
+    $mainScriptProcessId = $myPid
+    if (Test-Path "$monitorScriptPath" -PathType Leaf) {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -NoLogo -ExecutionPolicy Bypass -File `"$monitorScriptPath`" -MainScriptProcessId $mainScriptProcessId" -WindowStyle Hidden
+    }
 }
 
 # Check if the drive letter exists
@@ -184,10 +256,16 @@ $driveExists = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
 if ($driveExists) {
     Write-Output "Drive $driveLetter exists."
 
+    PreventSleep -myPid $PID
+    ForceKillRoboCopyInstances -myPid $PID
+
     # create backup folder if not exists
     If(!(test-path -PathType container $roboCopyBackupPath)) {
         New-Item -ItemType Directory -Path $roboCopyBackupPath -Force
     }
+
+    # Start the timer
+    $startTime = [System.Diagnostics.Stopwatch]::StartNew()
 
     $jobs = @()
     $totalJobs = $sourceDirectories.Count
@@ -262,10 +340,20 @@ if ($driveExists) {
 
     # Final progress bar update
     Write-Progress -Activity "Running Robocopy" -Status "All jobs completed." -PercentComplete 100 -Completed
+
+    # Stop the timer
+    $startTime.Stop()
+
+    # Get the elapsed time
+    $elapsedTime = $startTime.Elapsed
+
+    # Format the elapsed time into a readable string
+    $formattedTime = "{0:D2} hours, {1:D2} minutes, {2:D2} seconds, {3:D3} milliseconds" -f $elapsedTime.Hours, $elapsedTime.Minutes, $elapsedTime.Seconds, $elapsedTime.Milliseconds
+
+    Write-Host "`n`nExecution Time : $formattedTime" -BackgroundColor DarkCyan
+
 } else {
     Write-Output "Drive $driveLetter does not exist."
-    pause
-    exit
 }
 
 pause
