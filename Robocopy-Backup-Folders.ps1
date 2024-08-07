@@ -302,7 +302,7 @@ if ($driveExists) {
         $job = Start-Job -ScriptBlock {
             param ($src, $dest, $excFile, $excDirectorie, $logPath)
             # /XA:SH to exclude hidden and system files
-            $process = Start-Process -FilePath "robocopy.exe" -ArgumentList "`"$src`" `"$dest`" /E /DCOPY:DAT /COPY:DAT /MT:16 /R:0 /W:0 /NFL /NDL /NP /V /XF $excFile /XD $excDirectorie /TEE /UNILOG+:$logPath" -Wait -PassThru -WindowStyle Hidden
+            $process = Start-Process -FilePath "robocopy.exe" -ArgumentList "`"$src`" `"$dest`" /E /J /XJ /DCOPY:DAT /COPY:DAT /MT:16 /R:0 /W:0 /NFL /NDL /NP /V /XF $excFile /XD $excDirectorie /TEE /UNILOG+:$logPath" -Wait -PassThru -WindowStyle Hidden
             return $process.ExitCode
         } -ArgumentList $source, $destination, $singleLineFiles, $singleLineDirectories, $quotedLogName
 
